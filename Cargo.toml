@@ -4,17 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Zed
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+http_client = { git = "https://github.com/zed-industries/zed" }
+reqwest_client = { git = "https://github.com/zed-industries/zed" }
+# GPUI Component
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["inspector", "tree-sitter-languages"] }
+gpui-component-assets = {  git = "https://github.com/longbridge/gpui-component" } 
+# Other stuff
 anyhow = "1.0.102"
 bytes = "1.11.1"
 clap = { version = "4.6", features = ["derive"] }
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["inspector", "tree-sitter-languages"] }
-gpui-component-assets = {  git = "https://github.com/longbridge/gpui-component" } 
+futures = "0.3.32"
 markdown = { version = "1.0.0", features = ["serde"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 scraper = "0.27.0"
 url = "2.5.8"
 
-[patch.crates-io]
-async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+# [patch.crates-io]
+# async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
