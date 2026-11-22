@@ -2,15 +2,21 @@
 // IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+use std::{collections, error, fs, mem, sync, thread};
+
 use bytes;
 use clap::Parser;
-use gpui::*;
-use gpui_component::{
-    Root, Theme, ThemeMode, h_flex,
-    text::{TextView, TextViewState},
+use futures::{AsyncReadExt, future::join_all};
+use gpui_kit::{
+    component::{
+        text::{TextView, TextViewState},
+        *,
+    },
+    http_client::{AsyncBody, HttpClient},
+    *,
 };
-use gpui_component_assets::Assets;
 use reqwest::header::USER_AGENT;
+use reqwest_client::ReqwestClient;
 use scraper::{Html, Selector};
 use url::Url;
 
@@ -33,23 +39,18 @@ fn quit(_: &Quit, cx: &mut gpui::App) {
     cx.quit();
 }
 
-use futures::{AsyncReadExt, future::join_all};
-use gpui::http_client::{AsyncBody, HttpClient};
-use reqwest_client::ReqwestClient;
-use std::sync::{Arc, Mutex};
-
 fn main() {
     let cli = Cli::parse();
 
-    gpui_platform::application()
-        .with_assets(Assets)
-        .with_http_client(Arc::new(ReqwestClient::new()))
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .with_http_client(sync::Arc::new(ReqwestClient::new()))
         .run(move |cx| {
             if cli.github_trending {
                 trendy(cx);
                 return;
             }
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             cx.on_action(quit);
             cx.bind_keys(vec![KeyBinding::new("cmd-q", Quit, None)]);
             cx.set_menus(vec![
@@ -82,7 +83,7 @@ fn main() {
                             let content = cx
                                 .background_executor()
                                 .spawn(async move {
-                                    std::thread::spawn(move || load_content_blocking(&source_str))
+                                    thread::spawn(move || load_markdown_source(&source_str))
                                         .join()
                                         .unwrap_or_else(|_| {
                                             "# Thread Panic\n\nFailed to join network fetch thread."
@@ -138,9 +139,9 @@ struct TrendyRepoData {
 }
 
 async fn trendy_scrape_repo_page(
-    client: Arc<dyn HttpClient>,
+    client: sync::Arc<dyn HttpClient>,
     owner_repo: String,
-    data_pool: Arc<Mutex<Vec<TrendyRepoData>>>,
+    data_pool: sync::Arc<sync::Mutex<Vec<TrendyRepoData>>>,
 ) {
     let repo_url = format!("https://github.com/{}", owner_repo);
     let result = client.get(&repo_url, AsyncBody::empty(), true).await;
@@ -224,12 +225,12 @@ async fn trendy_scrape_repo_page(
 }
 
 async fn trendy_fetch_trending_timelines(
-    client: Arc<dyn HttpClient>,
+    client: sync::Arc<dyn HttpClient>,
     executor: gpui::BackgroundExecutor,
     endpoints: Vec<(&'static str, &'static str)>,
-    dedup_set: Arc<Mutex<std::collections::HashSet<String>>>,
-    sub_tasks: Arc<Mutex<Vec<gpui::Task<()>>>>,
-    data_pool: Arc<Mutex<Vec<TrendyRepoData>>>,
+    dedup_set: sync::Arc<sync::Mutex<collections::HashSet<String>>>,
+    sub_tasks: sync::Arc<sync::Mutex<Vec<gpui::Task<()>>>>,
+    data_pool: sync::Arc<sync::Mutex<Vec<TrendyRepoData>>>,
 ) {
     let mut tasks = Vec::new();
 
@@ -262,7 +263,12 @@ async fn trendy_fetch_trending_timelines(
 
                 for element in document.select(&row_selector) {
                     // let text = element.text().collect::<Vec<_>>().join("");
-                    let owner_repo = element.text().collect::<Vec<_>>().join("").replace("\n", "").replace(" ", "");
+                    let owner_repo = element
+                        .text()
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .replace("\n", "")
+                        .replace(" ", "");
 
                     // Real-time stream pipelining deduplication
                     let is_new = shared_set.lock().unwrap().insert(owner_repo.clone());
@@ -273,8 +279,11 @@ async fn trendy_fetch_trending_timelines(
                         let pool_pointer = final_pool.clone();
 
                         // Launch sub-scraper onto pool and anchor it immediately
-                        let sub_task =
-                            exec.spawn(trendy_scrape_repo_page(sub_client, target_repo, pool_pointer));
+                        let sub_task = exec.spawn(trendy_scrape_repo_page(
+                            sub_client,
+                            target_repo,
+                            pool_pointer,
+                        ));
                         task_tracker.lock().unwrap().push(sub_task);
                     }
                 }
@@ -302,9 +311,9 @@ fn trendy(cx: &mut gpui::App) {
             let executor = cx_owned.background_executor();
 
             // Central thread-safe aggregators
-            let dedup_set = Arc::new(Mutex::new(std::collections::HashSet::new()));
-            let deep_scrape_tasks = Arc::new(Mutex::new(Vec::new()));
-            let accumulated_repos = Arc::new(Mutex::new(Vec::<TrendyRepoData>::new()));
+            let dedup_set = sync::Arc::new(sync::Mutex::new(collections::HashSet::new()));
+            let deep_scrape_tasks = sync::Arc::new(sync::Mutex::new(Vec::new()));
+            let accumulated_repos = sync::Arc::new(sync::Mutex::new(Vec::<TrendyRepoData>::new()));
 
             // Step 1: Run timeline trackers to completion
             trendy_fetch_trending_timelines(
@@ -318,7 +327,7 @@ fn trendy(cx: &mut gpui::App) {
             .await;
 
             // Step 2: Extract and await all real-time pipelined sub-scrapers
-            let final_scrapers = std::mem::take(&mut *deep_scrape_tasks.lock().unwrap());
+            let final_scrapers = mem::take(&mut *deep_scrape_tasks.lock().unwrap());
             join_all(final_scrapers).await;
 
             println!("\n==================================================");
@@ -454,8 +463,180 @@ fn branch_from_git_raw(raw: &bytes::Bytes) -> Option<String> {
         })
 }
 
-// Load content from file or URL (blocking), handling GitHub repo URLs specially
-fn load_content_blocking(source: &str) -> SharedString {
+// Load markdown content from file or URL (blocking), handling GitHub repo URLs specially
+fn load_markdown_source(source: &str) -> SharedString {
+    match Url::parse(source) {
+        Ok(url) => load_markdown_source_from_url(&url),
+        _ => fs::read_to_string(source)
+            .unwrap_or_else(|err| {
+                format!(
+                    "# Error Loading File\n\nCould not read `{}`: **{}**",
+                    source, err
+                )
+            })
+            .into(),
+    }
+}
+
+fn load_markdown_source_from_url(url: &Url) -> SharedString {
+    reqwest::blocking::get(try_transform_url(url).unwrap_or_else(|| url.clone()))
+        .and_then(|r| r.text())
+        .map(|t| t.into())
+        .unwrap_or_else(|_| "# Error loading URL".into())
+}
+
+enum GitForge {
+    Github,
+    Codeberg,
+    Gitlab,
+}
+
+// Tries to transform an owner/repo URL for a Git forge, currently GitHub and Codeberg
+fn try_transform_url(url: &Url) -> Option<Url> {
+    eprintln!("TRYING TO TRANSFORM THE URL");
+    let domain = url.domain()?;
+    let domain = domain.strip_prefix("www.").unwrap_or(domain);
+
+    if !["https", "http"].contains(&url.scheme())
+    // || !["github.com", "codeberg.org", "gitlab.com"].contains(&domain)
+    {
+        return None;
+    }
+    eprintln!("  GOT OK DOMAIN AND SCHEME");
+
+    let forge = match domain {
+        "github.com" => GitForge::Github,
+        "codeberg.org" => GitForge::Codeberg,
+        "gitlab.com" => GitForge::Gitlab,
+        _ => return None,
+    };
+
+    eprintln!("  GOT THE GIT FORGE");
+
+    let mut segments = url.path_segments()?;
+    let owner = segments.next()?;
+    if owner.is_empty() {
+        eprintln!("  GOT AN EMPTY OWNER");
+        return None;
+    }
+    eprintln!("  GOT THE OWNER {owner}");
+    let repo = segments.next()?;
+    if repo.is_empty() {
+        eprintln!("  GOT AN EMPTY REPO");
+        return None;
+    }
+    eprintln!("  GOT THE REPO {repo}");
+    if segments.next().is_some_and(|s| !s.is_empty()) {
+        eprintln!("  GOT AN ADDITIONAL (non-empty) PATH SEGMENT");
+        return None;
+    }
+
+    eprintln!("  GOT THE OWNER AND REPO");
+
+    // Use git protocol to detect default branch
+    let discovery_url = into_discovery_url(&url)?;
+    eprintln!("  Discovery URL: {}", discovery_url);
+
+    let response = reqwest::blocking::get(discovery_url).ok()?;
+    let branch = branch_from_git_raw(&response.bytes().ok()?)?;
+    eprintln!("  Default branch: {}", branch);
+
+    // Construct raw GitHub URL for README
+    let readme_url = match forge {
+        GitForge::Github => scrape_best_readme_url(url.clone(), branch.clone())?,
+        GitForge::Codeberg => format!(
+            "https://codeberg.org/{}/{}/raw/branch/{}/README.md",
+            owner, repo, branch
+        ),
+        GitForge::Gitlab => format!(
+            "https://gitlab.com/{}/{}/-/raw/{}/README.md?ref_type=heads",
+            owner, repo, branch
+        ),
+    };
+
+    eprintln!("  README URL: {}", readme_url);
+    Url::parse(&readme_url).ok()
+}
+
+#[allow(dead_code)]
+fn scrape(forge: GitForge, owner: &str, repo: &str) -> Option<()> {
+    eprintln!("COMMENCE THE SCRAPING!");
+    let page_url = match forge {
+        GitForge::Github => format!("https://github.com/{}/{}", owner, repo),
+        GitForge::Codeberg => format!("https://codeberg.org/{}/{}", owner, repo),
+        GitForge::Gitlab => format!("https://gitlab.com/{}/{}", owner, repo),
+    };
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(&page_url)
+        .header(
+            USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RustScraper/1.0",
+        )
+        .send();
+    eprintln!("  FETCHED THE PAGE");
+    if response.is_err() {
+        eprintln!("Failed to fetch page: {}", response.err().unwrap());
+        return None;
+    }
+    let response = response.unwrap();
+    let response_str = response.text().unwrap();
+
+    let document = Html::parse_document(&response_str);
+
+    // Save HTML for inspection
+    if let Err(e) = fs::write("/tmp/github_page.html", &response_str) {
+        eprintln!("Failed to save HTML: {}", e);
+    } else {
+        eprintln!("  Saved HTML to /tmp/github_page.html");
+    }
+
+    // branch selector
+    // codeberg
+    // body > div > div > div.ui.container > div.repo-button-row > div.button-sequence.tw-gap-y-2 > div > div > button > span > strong
+
+    // dirent selector
+    // codeberg - dir
+    // #repo-files-table > tbody > tr:nth-child(6) > td.name.four.wide > span > a
+    // codeberg -file
+    // #repo-files-table > tbody > tr:nth-child(7) > td.name.four.wide > span > a
+
+    let (branch_selector, _file_selector): (Option<&str>, Option<&str>) = match forge {
+        GitForge::Github => (
+            // Try multiple possible selectors for branch name
+            Some("[data-menu-button]"), // Branch selector button
+            Some("a.Link--primary"),
+        ),
+        GitForge::Codeberg => (
+            Some(
+                "body > div > div > div.ui.container > div.repo-button-row > div.button-sequence.tw-gap-y-2 > div > div > button > span > strong",
+            ),
+            Some(
+                "body > div > div > div.ui.container > div.repo-button-row > div.button-sequence.tw-gap-y-2 > div > div > button > span > strong",
+            ),
+        ),
+        GitForge::Gitlab => (None, None),
+    };
+
+    // let's just try the branch first
+    if let Some(branch_selector) = branch_selector {
+        let branch_sel = Selector::parse(branch_selector);
+        eprintln!("  Parsed branch selector: {:?}", branch_sel);
+        let branch_sel = branch_sel.unwrap();
+
+        /* Branch:
+        <strong data-v-26c3e22e="" class="tw-ml-2 tw-inline-block gt-ellipsis">master</strong>
+         */
+        let mut branch_elem = document.select(&branch_sel);
+        eprintln!("  Selected branch element: {:?}", branch_elem.next());
+    }
+
+    None
+}
+
+#[allow(dead_code)]
+fn old_load_markdown_source(source: &str) -> SharedString {
     if let Ok(url) = Url::parse(source)
         && ["https", "http"].contains(&url.scheme())
     {
@@ -463,6 +644,9 @@ fn load_content_blocking(source: &str) -> SharedString {
         let source = (|| {
             let domain = url.domain()?;
             if !["github.com", "www.github.com"].contains(&domain) {
+                if domain == "codeberg.org" {
+                    eprintln!("⚠️ Codeberg not supported yet.")
+                }
                 return None;
             }
 
@@ -493,7 +677,7 @@ fn load_content_blocking(source: &str) -> SharedString {
             .into(),
         }
     } else {
-        std::fs::read_to_string(source)
+        fs::read_to_string(source)
             .unwrap_or_else(|err| {
                 format!(
                     "# Error Loading File\n\nCould not read `{}`: **{}**",
@@ -580,7 +764,7 @@ fn choose_best_readme(filenames: &Vec<String>) -> Option<&String> {
 // Scrape a GitHub directory and return a list of README filenames
 fn scrape_dir_for_readmes<U: reqwest::IntoUrl>(
     url: U,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn error::Error>> {
     // 1. Create a client and fetch the HTML (Must include a User-Agent)
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -633,6 +817,8 @@ fn scrape_dir_for_readmes<U: reqwest::IntoUrl>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections;
+
     use url::Url;
 
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -790,8 +976,8 @@ mod tests {
         );
         println!("{:?}", pairs);
 
-        let mut branch_tally = std::collections::HashMap::new();
-        let mut readme_tally = std::collections::HashMap::new();
+        let mut branch_tally = collections::HashMap::new();
+        let mut readme_tally = collections::HashMap::new();
         for pair in pairs {
             println!("==== {} ====", pair);
             let url = Url::parse(&format!("https://github.com{}", pair)).unwrap();
@@ -814,5 +1000,75 @@ mod tests {
         readme_tally_vec.sort_by(|a, b| b.1.cmp(&a.1));
         println!("\nBranch tally: {:?}", branch_tally_vec);
         println!("Readme tally: {:?}", readme_tally_vec);
+    }
+
+    #[test]
+    fn scrape_github_automattic_harper() {
+        // selector for most-outer div of default branch:
+        //   #repo-content-pjax-container > react-app > div > div:nth-child(4) > div.prc-PageLayout-PageLayoutRoot--KH-d > div > div > div > div > div > div > div > div > div.prc-PageLayout-ContentWrapper-gR9eG > div > div > div.OverviewContent-module__Box_1__MPS0U > div.OverviewContent-module__Box_2__Di8Pb
+        // selector for most-inner element of default branch:
+        //   #ref-picker-repos-header-ref-selector > span > span.prc-Button-Label-FWkx3 > div > div.ref-selector-button-text-container.RefSelectorAnchoredOverlay-module__RefSelectorBtnTextContainer__Di3rk > span
+        let url = Url::parse("https://github.com/automattic/harper").unwrap();
+        let client = reqwest::blocking::Client::new();
+        let resp = client.get(url).send().unwrap();
+        let doc_str = resp.text().unwrap();
+        let html = scraper::Html::parse_document(&doc_str);
+        // eprintln!("HTML: {:#?}", html);
+        let selector = scraper::Selector::parse("#ref-picker-repos-header-ref-selector").unwrap();
+        let mut elements = html.select(&selector);
+        let text = elements.next().unwrap().text().collect::<Vec<_>>().join("");
+        eprintln!("Text: ‘{}’", text.trim());
+    }
+
+    #[test]
+    fn scrape_codeberg_spacebusco_spacejunk() {
+        // selector for most-outer div of default branch:
+        //   body > div > div > div.ui.container > div.repo-button-row > div.button-sequence.tw-gap-y-2 > div
+        // selector for most-inner element of default branch:
+        //   body > div > div > div.ui.container > div.repo-button-row > div.button-sequence.tw-gap-y-2 > div > div > button > span
+        let url = Url::parse("https://codeberg.org/Spacebusco/spacejunk").unwrap();
+        let client = reqwest::blocking::Client::new();
+        let resp = client.get(url).send().unwrap();
+        let doc_str = resp.text().unwrap();
+        let html = scraper::Html::parse_document(&doc_str);
+        // eprintln!("HTML: {:#?}", html);
+        let selector = scraper::Selector::parse(".branch-dropdown-button").unwrap();
+        let mut elements = html.select(&selector);
+        let text = elements.next().unwrap().text().collect::<Vec<_>>().join("");
+        eprintln!("Text: ‘{}’", text.trim());
+    }
+
+    #[test]
+    fn gitlab_api_for_msammels_apple_lisa() {
+        // GitLab is built from JS and the HTML lacks the info to scrape!
+        let owner_repo = "msammels/Apple-Lisa";
+        // Use the Gitlab API
+
+        let client = reqwest::blocking::Client::new();
+
+        let default_branch_api_url = format!(
+            "https://gitlab.com/api/v4/projects/{}/repository/branches/main",
+            urlencoding::encode(owner_repo)
+        );
+        let branch_resp = client.get(&default_branch_api_url).send().unwrap();
+        let branch_json = branch_resp.json::<serde_json::Value>().unwrap();
+        // json is an object and we want the 'name'
+        let default_branch_name = branch_json.get("name").unwrap().as_str().unwrap();
+        eprintln!("Default branch name: {}", default_branch_name);
+
+        let tree_api_url = format!(
+            "https://gitlab.com/api/v4/projects/{}/repository/tree",
+            urlencoding::encode(owner_repo)
+        );
+        let tree_resp = client.get(&tree_api_url).send().unwrap();
+        let tree_json = tree_resp.json::<serde_json::Value>().unwrap();
+        // json is an array of objects, we want the 'name' of each one
+        let names: Vec<String> = tree_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.get("name").unwrap().as_str().unwrap().to_string())
+            .collect();
+        eprintln!("Names: {:#?}", names);
     }
 }
